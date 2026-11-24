@@ -116,7 +116,7 @@ function formatNewLines(nLines: string[], tier: number, firstMatchedLine: string
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
-  readonly moves = new Map<string, string>();
+  readonly moves = new Map<string, string>(); // newPath -> oldPath
 
   original(p: string): string | null {
     if (!this.orig.has(p)) {
@@ -148,6 +148,7 @@ function detect(lines: string[]): string | null {
   return null;
 }
 
+/** One JSON edit object (SPEC.md section 9), or null when it is not one. */
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
@@ -293,10 +294,6 @@ function unifiedEdits(lines: string[]): Edit[] {
       if (next === undefined || !next.startsWith('+++ ')) {
         throw new Exit2(`error: parse ${i + 2}`);
       }
-      if (curSection !== null && curSection.hunks.length === 0 && curHunk === null && curSection.oldPath !== null) {
-        sections.push(curSection);
-        curSection = null;
-      }
       if (curSection === null) {
         curSection = { oldPath: null, newPath: null, isCreate: false, isDelete: false, hunks: [] };
       }
@@ -349,6 +346,7 @@ function unifiedEdits(lines: string[]): Edit[] {
         lines: [],
         noNewline: false,
       };
+      // Parse hunk body
       i++;
       while (i < lines.length) {
         const bl = lines[i]!;
@@ -428,7 +426,80 @@ function unifiedEdits(lines: string[]): Edit[] {
         return;
       }
 
-      // Normal or move change
+      if (isMove) {
+        const oldP = sec.oldPath!;
+        const newP = sec.newPath!;
+        const beforeText = tree.get(oldP);
+        if (beforeText === null) throw new Fail('missing', oldP);
+        if (tree.get(newP) !== null) throw new Fail('exists', newP);
+
+        const fl = parseFileLines(beforeText);
+        let currentLines = [...fl.lines];
+        let d = 0;
+        let lastNoNewline = !fl.finalNewline;
+
+        for (const h of sec.hunks) {
+          const oLines: string[] = [];
+          for (const line of h.lines) {
+            if (line.op === ' ' || line.op === '-') {
+              oLines.push(line.text);
+            }
+          }
+
+          if (oLines.length > 0) {
+            const { tier, indices } = findOldLines(currentLines, oLines, strict);
+            if (indices.length === 0) throw new Fail('no-match', oldP);
+            const targetPos = h.aStart - 1 + d;
+            let bestIdx = indices[0]!;
+            let minDist = Math.abs(bestIdx - targetPos);
+            for (let idx = 1; idx < indices.length; idx++) {
+              const dist = Math.abs(indices[idx]! - targetPos);
+              if (dist < minDist) {
+                minDist = dist;
+                bestIdx = indices[idx]!;
+              }
+            }
+            const firstMatched = currentLines[bestIdx]!;
+            const firstOld = oLines[0]!;
+
+            let fileLineIdx = bestIdx;
+            const mappedN: string[] = [];
+            for (const hl of h.lines) {
+              if (hl.op === ' ') {
+                mappedN.push(currentLines[fileLineIdx]!);
+                fileLineIdx++;
+              } else if (hl.op === '-') {
+                fileLineIdx++;
+              } else if (hl.op === '+') {
+                mappedN.push(hl.text);
+              }
+            }
+            const formattedMappedN = formatNewLines(mappedN, tier, firstMatched, firstOld);
+            currentLines.splice(bestIdx, oLines.length, ...formattedMappedN);
+            d += formattedMappedN.length - oLines.length;
+          } else {
+            let insertPos = h.aStart + d;
+            if (insertPos < 0) insertPos = 0;
+            if (insertPos > currentLines.length) insertPos = currentLines.length;
+            const nLines: string[] = h.lines.filter((l) => l.op === '+').map((l) => l.text);
+            currentLines.splice(insertPos, 0, ...nLines);
+            d += nLines.length;
+          }
+          if (h.noNewline) lastNoNewline = true;
+        }
+
+        const outFl: FileLines = {
+          lines: currentLines,
+          crlf: fl.crlf,
+          finalNewline: !lastNoNewline,
+        };
+        tree.now.set(newP, serializeFileLines(outFl));
+        tree.now.set(oldP, null);
+        tree.moves.set(newP, oldP);
+        return;
+      }
+
+      // Normal change of one path
       const beforeText = tree.get(path);
       if (beforeText === null) throw new Fail('missing', path);
       const fl = parseFileLines(beforeText);
@@ -491,13 +562,7 @@ function unifiedEdits(lines: string[]): Edit[] {
         crlf: fl.crlf,
         finalNewline: !lastNoNewline,
       };
-      const targetP = isMove ? sec.newPath! : path;
-      if (isMove && tree.get(sec.newPath!) !== null) throw new Fail('exists', sec.newPath!);
-      tree.now.set(targetP, serializeFileLines(outFl));
-      if (isMove) {
-        tree.now.set(path, null);
-        tree.moves.set(targetP, path);
-      }
+      tree.now.set(path, serializeFileLines(outFl));
     });
   }
 
@@ -910,8 +975,9 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   
+  // Build change rows
   const changedPaths = [...tree.now.keys()].filter((p) => tree.original(p) !== tree.now.get(p));
-  const moveMap = tree.moves;
+  const moveMap = tree.moves; // newPath -> oldPath
   const handledPaths = new Set<string>();
   const rows: { sortPath: string; line: string }[] = [];
 
@@ -923,6 +989,7 @@ function run(args: string[]): { code: number; out: string[] } {
 
     if (moveMap.has(p)) {
       const oldP = moveMap.get(p)!;
+      // Check if oldP was deleted
       if (tree.original(oldP) !== null && tree.now.get(oldP) === null) {
         handledPaths.add(oldP);
         handledPaths.add(p);
@@ -939,6 +1006,7 @@ function run(args: string[]): { code: number; out: string[] } {
       }
     }
 
+    // Check if this is a delete that matches a move in reverse
     let isMovePair = false;
     if (was !== null && now === null) {
       for (const [newP, oldP] of moveMap.entries()) {
